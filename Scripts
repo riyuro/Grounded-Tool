@@ -1,0 +1,647 @@
+# -*- coding: utf-8 -*-
+"""
+Auto-tag bartender language design intent with a 3-axis model and visualize.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+import math
+import re
+import xml.etree.ElementTree as etree
+import zipfile
+
+from openai import OpenAI
+import json_repair
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+try:
+    from qualcoder import docx as qc_docx
+except Exception:
+    qc_docx = None
+
+
+AXIS_HELP = {
+    "x": "Implicit (-1) ↔ Direct (1)",
+    "y": "Conceptual (-1) ↔ Specific (1)",
+    "z": "Complicated (-1) ↔ Simple (1)",
+}
+
+
+@dataclass
+class IntentPoint:
+    term: str
+    intent: str
+    cocktail_id: str
+    bartender: str
+    category: str
+    x: float
+    y: float
+    z: float
+    shape: str
+
+
+SHAPES = ["circle", "square", "triangle", "diamond", "star", "pentagon", "hexagon"]
+PALETTE = [
+    (68, 114, 196),   # blue
+    (237, 125, 49),   # orange
+    (112, 173, 71),   # green
+    (165, 165, 165),  # gray
+    (255, 192, 0),    # yellow
+    (91, 155, 213),   # light blue
+    (192, 80, 77),    # red
+]
+CATEGORY_DEFS = {
+    "design_intent": {"label": "設計意圖", "shape": "diamond"},
+    "taste": {"label": "味道", "shape": "circle"},
+    "sensory": {"label": "觸覺/嗅覺", "shape": "square"},
+    "material": {"label": "材料", "shape": "triangle"},
+    "technique": {"label": "手法/製程", "shape": "pentagon"},
+    "other": {"label": "其他", "shape": "hexagon"},
+}
+PLOTLY_SYMBOLS = {
+    "circle": "circle",
+    "square": "square",
+    "triangle": "triangle-up",
+    "diamond": "diamond",
+    "star": "star",
+    "pentagon": "pentagon",
+    "hexagon": "hexagon",
+}
+
+
+def clamp(val: float, min_val: float = -1.0, max_val: float = 1.0) -> float:
+    return max(min_val, min(max_val, val))
+
+
+def read_docx_text(path: str) -> str:
+    xmlcontent = zipfile.ZipFile(path).read("word/document.xml")
+    document = etree.fromstring(xmlcontent)
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    paratextlist = []
+    paralist = [e for e in document.iter() if e.tag == f"{{{ns}}}p"]
+    for para in paralist:
+        paratext = ""
+        for element in para.iter():
+            if element.tag == f"{{{ns}}}t":
+                if element.text:
+                    paratext += element.text
+            elif element.tag == f"{{{ns}}}tab":
+                paratext += "\t"
+        if paratext:
+            paratextlist.append(paratext)
+    return "\n".join(paratextlist).strip()
+
+
+def load_text(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".docx":
+        if qc_docx is not None:
+            document = qc_docx.opendocx(path)
+            paragraphs = qc_docx.getdocumenttext(document)
+            return "\n".join(paragraphs).strip()
+        return read_docx_text(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def build_prompt(text: str, max_items: int) -> List[Dict[str, str]]:
+    system = (
+        "你是質性研究與服務設計助理。請從文本中抽取能呈現調酒設計意圖的關鍵詞或短語，"
+        "並依三軸模型判斷語意程度與類別。"
+    )
+    category_list = ", ".join([f"{k}({v['label']})" for k, v in CATEGORY_DEFS.items()])
+    user = f"""
+三軸模型：
+X 軸：Implicit (-1) ↔ Direct (1)
+Y 軸：Conceptual (-1) ↔ Specific (1)
+Z 軸：Complicated (-1) ↔ Simple (1)
+
+任務：
+1) 從文本中抓取調酒編號（如 P1-1），並在每個項目標記 cocktail_id。
+2) 依調酒編號推導調酒師編號：bartender = "P1" 這種格式（即 P1-1 的前半段）。
+3) 請確保每一杯調酒（每個不同的 cocktail_id）都有關鍵詞/短語可被代表。
+4) 從文本中抽取最多 {max_items} 個「關鍵詞或短語」，由你判斷何者最能代表調酒設計意圖。
+5) 關鍵詞請保持精簡，避免過長；每個詞彙/短語不超過 8 個字或 16 個字符。
+6) 為每個詞彙/短語提供一個簡短的語意說明（intent）。
+7) 為每個詞彙/短語指定 category，必須從下列清單擇一：{category_list}。
+8) 給出每個詞彙的 (x,y,z) 座標，範圍 -1 到 1。
+9) 僅輸出 JSON，不要加入多餘文字。
+
+輸出格式：
+{{
+  "items": [
+    {{"term": "...", "intent": "...", "category": "design_intent", "cocktail_id": "P1-1", "bartender": "P1", "x": 0.0, "y": 0.0, "z": 0.0}}
+  ]
+}}
+
+文本：
+\"\"\"{text}\"\"\"
+""".strip()
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def call_openai(text: str, model: str, max_items: int) -> Dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY env var.")
+    client = OpenAI(api_key=api_key)
+    messages = build_prompt(text, max_items)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content
+    except Exception:
+        # fallback without enforced JSON if provider does not support response_format
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content
+    try:
+        return json.loads(content)
+    except Exception:
+        return json_repair.loads(content)
+
+
+def normalize_items(items: List[Dict[str, Any]]) -> List[IntentPoint]:
+    normalized: List[IntentPoint] = []
+    for i, item in enumerate(items):
+        term = str(item.get("term", "")).strip()
+        intent = str(item.get("intent", "")).strip()
+        cocktail_id = str(item.get("cocktail_id", "")).strip()
+        bartender = str(item.get("bartender", "")).strip()
+        category = str(item.get("category", "other")).strip()
+        if category not in CATEGORY_DEFS:
+            category = "other"
+        if not bartender and cocktail_id:
+            match = re.match(r"^(P\d+)", cocktail_id, re.IGNORECASE)
+            if match:
+                bartender = match.group(1).upper()
+        if not bartender:
+            bartender = "unknown"
+        x = clamp(float(item.get("x", 0.0)))
+        y = clamp(float(item.get("y", 0.0)))
+        z = clamp(float(item.get("z", 0.0)))
+        shape = CATEGORY_DEFS[category]["shape"]
+        if term:
+            normalized.append(
+                IntentPoint(
+                    term=term,
+                    intent=intent,
+                    cocktail_id=cocktail_id,
+                    bartender=bartender,
+                    category=category,
+                    x=x,
+                    y=y,
+                    z=z,
+                    shape=shape,
+                )
+            )
+    return normalized
+
+
+def bartender_to_color(name: str, name_map: Dict[str, int]) -> Tuple[int, int, int]:
+    idx = name_map.get(name, 0)
+    return PALETTE[idx % len(PALETTE)]
+
+
+def draw_shape(draw: ImageDraw.ImageDraw, shape: str, center: Tuple[float, float], size: int, fill: Tuple[int, int, int]):
+    cx, cy = center
+    half = size / 2
+    if shape == "circle":
+        draw.ellipse([cx - half, cy - half, cx + half, cy + half], fill=fill)
+    elif shape == "square":
+        draw.rectangle([cx - half, cy - half, cx + half, cy + half], fill=fill)
+    elif shape == "triangle":
+        points = [(cx, cy - half), (cx - half, cy + half), (cx + half, cy + half)]
+        draw.polygon(points, fill=fill)
+    elif shape == "diamond":
+        points = [(cx, cy - half), (cx - half, cy), (cx, cy + half), (cx + half, cy)]
+        draw.polygon(points, fill=fill)
+    elif shape == "star":
+        points = [
+            (cx, cy - half),
+            (cx + half * 0.38, cy - half * 0.2),
+            (cx + half, cy + half * 0.1),
+            (cx + half * 0.5, cy + half * 0.35),
+            (cx + half * 0.62, cy + half),
+            (cx, cy + half * 0.55),
+            (cx - half * 0.62, cy + half),
+            (cx - half * 0.5, cy + half * 0.35),
+            (cx - half, cy + half * 0.1),
+            (cx - half * 0.38, cy - half * 0.2),
+        ]
+        draw.polygon(points, fill=fill)
+    elif shape == "pentagon":
+        points = [
+            (cx, cy - half),
+            (cx + half * 0.95, cy - half * 0.3),
+            (cx + half * 0.6, cy + half),
+            (cx - half * 0.6, cy + half),
+            (cx - half * 0.95, cy - half * 0.3),
+        ]
+        draw.polygon(points, fill=fill)
+    elif shape == "hexagon":
+        points = [
+            (cx - half * 0.6, cy - half),
+            (cx + half * 0.6, cy - half),
+            (cx + half, cy),
+            (cx + half * 0.6, cy + half),
+            (cx - half * 0.6, cy + half),
+            (cx - half, cy),
+        ]
+        draw.polygon(points, fill=fill)
+    else:
+        draw.ellipse([cx - half, cy - half, cx + half, cy + half], fill=fill)
+
+
+def overlay_points(
+    base_image_path: str,
+    points: List[IntentPoint],
+    output_path: str,
+    size: int = 22,
+    scale: float | None = None,
+    label: bool = True,
+) -> None:
+    image = Image.open(base_image_path).convert("RGBA")
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    center = (width / 2, height / 2)
+    radius = scale if scale is not None else min(width, height) * 0.35
+    font = None
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    bartender_names = []
+    for point in points:
+        if point.bartender not in bartender_names:
+            bartender_names.append(point.bartender)
+    bartender_map = {name: idx for idx, name in enumerate(bartender_names)}
+
+    for point in points:
+        px = center[0] + point.x * radius
+        py = center[1] - point.y * radius
+        color = bartender_to_color(point.bartender, bartender_map)
+        draw_shape(draw, point.shape, (px, py), size, color)
+        if label:
+            label_text = f"{point.cocktail_id} {point.term}".strip()
+            draw.text((px + size * 0.6, py - size * 0.6), label_text, fill=color, font=font)
+
+    image.save(output_path)
+
+
+def create_axis_background(output_dir: str, width: int, height: int) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "axis_background.png")
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(image)
+    font = None
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    center = (width / 2, height / 2)
+    radius = min(width, height) * 0.35
+
+    # Axis lines
+    line_color = (200, 200, 200, 255)
+    draw.line([center[0] - radius, center[1], center[0] + radius, center[1]], fill=line_color, width=2)
+    draw.line([center[0], center[1] - radius, center[0], center[1] + radius], fill=line_color, width=2)
+    draw.line(
+        [center[0] - radius * 0.7, center[1] + radius * 0.7, center[0] + radius * 0.7, center[1] - radius * 0.7],
+        fill=line_color,
+        width=1,
+    )
+
+    # Labels
+    draw.text((center[0] + radius + 10, center[1] - 10), "Direct", fill=line_color, font=font)
+    draw.text((center[0] - radius - 70, center[1] - 10), "Implicit", fill=line_color, font=font)
+    draw.text((center[0] - 25, center[1] - radius - 25), "Specific", fill=line_color, font=font)
+    draw.text((center[0] - 35, center[1] + radius + 5), "Conceptual", fill=line_color, font=font)
+    draw.text((center[0] + radius * 0.45, center[1] - radius * 0.45 - 20), "Complicated", fill=line_color, font=font)
+    draw.text((center[0] - radius * 0.6, center[1] + radius * 0.6 + 5), "Simple", fill=line_color, font=font)
+
+    image.save(path)
+    return path
+
+
+def save_outputs(points: List[IntentPoint], output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, "intent_points.json")
+    csv_path = os.path.join(output_dir, "intent_points.csv")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "axis": AXIS_HELP,
+                "items": [
+                    {
+                        "term": p.term,
+                        "intent": p.intent,
+                        "category": p.category,
+                        "cocktail_id": p.cocktail_id,
+                        "bartender": p.bartender,
+                        "x": p.x,
+                        "y": p.y,
+                        "z": p.z,
+                        "shape": p.shape,
+                    }
+                    for p in points
+                ],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["term", "intent", "category", "cocktail_id", "bartender", "x", "y", "z", "shape"])
+        for p in points:
+            writer.writerow([p.term, p.intent, p.category, p.cocktail_id, p.bartender, p.x, p.y, p.z, p.shape])
+
+
+def next_versioned_path(output_dir: str, basename: str, ext: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    n = 1
+    while True:
+        candidate = os.path.join(output_dir, f"{basename}_v{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def generate_interactive_plot(points: List[IntentPoint], output_path: str, shape_scale: float) -> None:
+    bartender_names = []
+    for point in points:
+        if point.bartender not in bartender_names:
+            bartender_names.append(point.bartender)
+    bartender_map = {name: idx for idx, name in enumerate(bartender_names)}
+
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    zs = [p.z for p in points]
+    colors = [bartender_to_color(p.bartender, bartender_map) for p in points]
+    colors_rgb = [f"rgb({c[0]},{c[1]},{c[2]})" for c in colors]
+    symbols = [PLOTLY_SYMBOLS.get(p.shape, "circle") for p in points]
+    terms = [p.term for p in points]
+    cocktail_ids = [p.cocktail_id for p in points]
+    hover = [
+        f"{p.cocktail_id}<br>{p.term}<br>({p.x:.2f}, {p.y:.2f}, {p.z:.2f})<br>{p.intent}<br>{CATEGORY_DEFS[p.category]['label']}"
+        for p in points
+    ]
+    sizes = [max(16, min(70, (18 + len(t) * 6) * shape_scale * 0.5)) for t in terms]
+
+    data = [
+        {
+            "type": "scatter3d",
+            "mode": "markers",
+            "x": xs,
+            "y": ys,
+            "z": zs,
+            "marker": {"size": sizes, "color": colors_rgb, "symbol": symbols, "opacity": 0.95},
+            "hovertext": hover,
+            "hoverinfo": "text",
+            "name": "keyword",
+        },
+        {
+            "type": "scatter3d",
+            "mode": "text",
+            "x": xs,
+            "y": ys,
+            "z": [z + 0.08 for z in zs],
+            "text": cocktail_ids,
+            "textposition": "top center",
+            "textfont": {"color": "white", "size": 12},
+            "hoverinfo": "skip",
+            "name": "cocktail_id",
+        },
+    ]
+
+    axis_len = 1.8
+    axis_lines = [
+        # X axis (Implicit ↔ Direct)
+        {"x": [-axis_len, axis_len], "y": [0, 0], "z": [0, 0]},
+        # Y axis (Conceptual ↔ Specific)
+        {"x": [0, 0], "y": [-axis_len, axis_len], "z": [0, 0]},
+        # Z axis (Complicated ↔ Simple)
+        {"x": [0, 0], "y": [0, 0], "z": [-axis_len, axis_len]},
+    ]
+    for axis in axis_lines:
+        data.append(
+            {
+                "type": "scatter3d",
+                "mode": "lines",
+                "x": axis["x"],
+                "y": axis["y"],
+                "z": axis["z"],
+                "line": {"color": "#fff", "width": 2, "dash": "dash"},
+                "hoverinfo": "skip",
+                "showlegend": False,
+            }
+        )
+
+    label_offset = 0.2
+    axis_labels = [
+        {"x": axis_len + label_offset, "y": 0, "z": 0, "text": "Direct"},
+        {"x": -axis_len - label_offset, "y": 0, "z": 0, "text": "Implicit"},
+        {"x": 0, "y": axis_len + label_offset, "z": 0, "text": "Specific"},
+        {"x": 0, "y": -axis_len - label_offset, "z": 0, "text": "Conceptual"},
+        {"x": 0, "y": 0, "z": axis_len + label_offset, "text": "Simple"},
+        {"x": 0, "y": 0, "z": -axis_len - label_offset, "text": "Complicated"},
+    ]
+    data.append(
+        {
+            "type": "scatter3d",
+            "mode": "text",
+            "x": [a["x"] for a in axis_labels],
+            "y": [a["y"] for a in axis_labels],
+            "z": [a["z"] for a in axis_labels],
+            "text": [a["text"] for a in axis_labels],
+            "textfont": {"color": "white", "size": 14},
+            "hoverinfo": "skip",
+            "showlegend": False,
+        }
+    )
+
+    layout = {
+        "scene": {
+            "xaxis": {
+                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
+                "showbackground": False,
+                "showgrid": False,
+                "zeroline": False,
+                "showticklabels": False,
+                "visible": False,
+            },
+            "yaxis": {
+                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
+                "showbackground": False,
+                "showgrid": False,
+                "zeroline": False,
+                "showticklabels": False,
+                "visible": False,
+            },
+            "zaxis": {
+                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
+                "showbackground": False,
+                "showgrid": False,
+                "zeroline": False,
+                "showticklabels": False,
+                "visible": False,
+            },
+            "bgcolor": "black",
+        },
+        "paper_bgcolor": "black",
+        "font": {"color": "white"},
+        "hoverlabel": {"font": {"size": 12}},
+        "margin": {"l": 40, "r": 240, "t": 40, "b": 40},
+        "title": "Cocktail Design Intent Map",
+        "showlegend": False,
+    }
+
+    legend_entries = []
+    used_categories = []
+    for p in points:
+        if p.category not in used_categories:
+            used_categories.append(p.category)
+    for key, meta in CATEGORY_DEFS.items():
+        if key in used_categories:
+            legend_entries.append((meta["shape"], meta["label"]))
+
+    def svg_for_shape(shape: str) -> str:
+        if shape == "square":
+            return '<svg width="22" height="22"><rect x="3" y="3" width="16" height="16" fill="#ccc"/></svg>'
+        if shape == "circle":
+            return '<svg width="22" height="22"><circle cx="11" cy="11" r="8" fill="#ccc"/></svg>'
+        if shape == "triangle":
+            return '<svg width="22" height="22"><polygon points="11,3 19,19 3,19" fill="#ccc"/></svg>'
+        if shape == "diamond":
+            return '<svg width="22" height="22"><polygon points="11,3 19,11 11,19 3,11" fill="#ccc"/></svg>'
+        if shape == "star":
+            return '<svg width="22" height="22"><polygon points="11,2 13,8 20,8 14,12 16,19 11,15 6,19 8,12 2,8 9,8" fill="#ccc"/></svg>'
+        if shape == "pentagon":
+            return '<svg width="22" height="22"><polygon points="11,2 20,8 16,19 6,19 2,8" fill="#ccc"/></svg>'
+        if shape == "hexagon":
+            return '<svg width="22" height="22"><polygon points="6,3 16,3 20,11 16,19 6,19 2,11" fill="#ccc"/></svg>'
+        return '<svg width="22" height="22"><circle cx="11" cy="11" r="8" fill="#ccc"/></svg>'
+
+    legend_html = "".join(
+        [
+            f'<div class="legend-item">{svg_for_shape(shape)}<span>{shape_label}</span></div>'
+            for shape, shape_label in legend_entries
+        ]
+    )
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <style>
+    body {{ margin:0; background:black; color:white; font-family: Arial, sans-serif; }}
+    #wrap {{ display:flex; height:100vh; }}
+    #plot {{ flex:1; }}
+    #legend {{
+      width:220px;
+      padding:16px 10px;
+      border-left:1px solid #333;
+      background:#000;
+      box-sizing:border-box;
+    }}
+    .legend-title {{ font-size:14px; margin-bottom:8px; }}
+    .legend-item {{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      margin-bottom:6px;
+      font-size:13px;
+    }}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="plot"></div>
+    <div id="legend">
+      <div class="legend-title">類別圖示</div>
+      {legend_html}
+    </div>
+  </div>
+  <script>
+    const data = {json.dumps(data, ensure_ascii=False)};
+    const layout = {json.dumps(layout, ensure_ascii=False)};
+    Plotly.newPlot('plot', data, layout, {{displaylogo: false}});
+  </script>
+</body>
+</html>
+"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Auto-tag bartender language design intent.")
+    parser.add_argument("--input", required=True, help="Path to input text file.")
+    parser.add_argument("--image", help="Path to background coordinate image.")
+    parser.add_argument("--output-dir", default="outputs", help="Output directory.")
+    parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model name.")
+    parser.add_argument("--max-items", type=int, default=12, help="Max number of keywords.")
+    parser.add_argument("--point-size", type=int, default=22, help="Marker size in pixels.")
+    parser.add_argument("--scale", type=float, default=None, help="Axis radius in pixels.")
+    parser.add_argument("--no-label", action="store_true", help="Disable term labels on image.")
+    parser.add_argument("--interactive", action="store_true", help="Generate interactive HTML instead of PNG.")
+    parser.add_argument("--shape-scale", type=float, default=2.0, help="Scale factor for marker size in interactive mode.")
+    parser.add_argument("--width", type=int, default=1000, help="Auto background width.")
+    parser.add_argument("--height", type=int, default=1000, help="Auto background height.")
+    args = parser.parse_args()
+
+    text = load_text(args.input)
+    data = call_openai(text, args.model, args.max_items)
+    items = data.get("items", [])
+    points = normalize_items(items)
+    if not points:
+        raise RuntimeError("No items returned from model.")
+
+    save_outputs(points, args.output_dir)
+    if args.interactive:
+        output_html_path = next_versioned_path(args.output_dir, "intent_points_interactive", ".html")
+        generate_interactive_plot(points, output_html_path, args.shape_scale)
+        print(f"Saved: {output_html_path}")
+    else:
+        base_image_path = args.image
+        if not base_image_path:
+            base_image_path = create_axis_background(args.output_dir, args.width, args.height)
+        output_image_path = next_versioned_path(args.output_dir, "intent_points_overlay", ".png")
+        overlay_points(
+            base_image_path=base_image_path,
+            points=points,
+            output_path=output_image_path,
+            size=args.point_size,
+            scale=args.scale,
+            label=not args.no_label,
+        )
+        print(f"Saved: {output_image_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
