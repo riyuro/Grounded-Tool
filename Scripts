@@ -29,9 +29,8 @@ except Exception:
 
 
 AXIS_HELP = {
-    "x": "Implicit (-1) ↔ Direct (1)",
-    "y": "Conceptual (-1) ↔ Specific (1)",
-    "z": "Complicated (-1) ↔ Simple (1)",
+    "x": "Time (minutes)",
+    "y": "Cocktail ID",
 }
 
 
@@ -42,9 +41,8 @@ class IntentPoint:
     cocktail_id: str
     bartender: str
     category: str
-    x: float
-    y: float
-    z: float
+    time_min: int
+    action_label: str
     shape: str
 
 
@@ -58,13 +56,22 @@ PALETTE = [
     (91, 155, 213),   # light blue
     (192, 80, 77),    # red
 ]
-CATEGORY_DEFS = {
-    "design_intent": {"label": "設計意圖", "shape": "diamond"},
-    "taste": {"label": "味道", "shape": "circle"},
-    "sensory": {"label": "觸覺/嗅覺", "shape": "square"},
-    "material": {"label": "材料", "shape": "triangle"},
-    "technique": {"label": "手法/製程", "shape": "pentagon"},
-    "other": {"label": "其他", "shape": "hexagon"},
+CATEGORY_DEFS_PHASE1 = {
+    "aroma": {"label": "Aroma", "shape": "circle"},
+    "appearance": {"label": "Appearance", "shape": "diamond"},
+    "ingredient": {"label": "Ingredient", "shape": "triangle"},
+    "flavor": {"label": "Flavor", "shape": "hexagon"},
+}
+CATEGORY_COLORS_PHASE1 = {
+    "aroma": (0, 128, 0),
+    "appearance": (30, 144, 255),
+    "ingredient": (255, 140, 0),
+    "flavor": (128, 0, 128),
+}
+CATEGORY_DEFS_PHASE2 = {
+    "idealing": {"label": "Idealing", "shape": "star"},
+    "calibration": {"label": "Calibration", "shape": "circle"},
+    "balancing": {"label": "Balancing", "shape": "square"},
 }
 PLOTLY_SYMBOLS = {
     "circle": "circle",
@@ -100,6 +107,63 @@ def read_docx_text(path: str) -> str:
     return "\n".join(paratextlist).strip()
 
 
+def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    font_paths = [
+        "C:\\Windows\\Fonts\\msjh.ttc",
+        "C:\\Windows\\Fonts\\msjhbd.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    for path in font_paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def extract_cocktail_ids(text: str) -> List[str]:
+    matches = re.findall(r"\bP\d+-\d+\b", text)
+    unique = []
+    for m in matches:
+        if m not in unique:
+            unique.append(m)
+    return unique
+
+
+def extract_max_minutes(text: str) -> int | None:
+    patterns = [
+        r"(\d{1,3})\s*minutes?",
+        r"(\d{1,3})\s*mins?",
+        r"(\d{1,3})\s*min\b",
+        r"(\d{1,3})\s*分鐘",
+    ]
+    time_patterns = [
+        r"\b(\d{1,2}):(\d{2})\b",
+    ]
+    values = []
+    for pat in patterns:
+        for match in re.findall(pat, text, flags=re.IGNORECASE):
+            try:
+                value = int(match)
+                if 0 < value <= 60:
+                    values.append(value)
+            except Exception:
+                continue
+    for pat in time_patterns:
+        for mm, ss in re.findall(pat, text):
+            try:
+                minutes = int(mm)
+                seconds = int(ss)
+                if 0 <= seconds <= 59:
+                    rounded = minutes + (1 if seconds >= 30 else 0)
+                    if 0 < rounded <= 60:
+                        values.append(rounded)
+            except Exception:
+                continue
+    return max(values) if values else None
+
+
 def load_text(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".docx":
@@ -112,37 +176,68 @@ def load_text(path: str) -> str:
         return f.read().strip()
 
 
-def build_prompt(text: str, max_items: int) -> List[Dict[str, str]]:
+def build_prompt(
+    text: str,
+    max_items: int,
+    phase: int,
+    category_defs: Dict[str, Dict[str, str]],
+    phase1_category: str | None,
+    max_minutes: int | None,
+) -> List[Dict[str, str]]:
     system = (
-        "你是質性研究與服務設計助理。請從文本中抽取能呈現調酒設計意圖的關鍵詞或短語，"
-        "並依三軸模型判斷語意程度與類別。"
+        "You are a qualitative research and service design assistant. Extract short keywords or phrases "
+        "that represent the cocktail design intent, and label time points and cocktail IDs."
     )
-    category_list = ", ".join([f"{k}({v['label']})" for k, v in CATEGORY_DEFS.items()])
+    category_list = ", ".join([f"{k}({v['label']})" for k, v in category_defs.items()])
+    phase_instructions = ""
+    max_minutes_note = ""
+    if max_minutes:
+        max_minutes_note = f"Use 1..{max_minutes} as the timeline bounds."
+    if phase == 1:
+        focus = ""
+        if phase1_category:
+            focus = f"Only label content related to {phase1_category} in this run."
+        phase_instructions = (
+            "Phase 1: classify references to aroma, appearance, and ingredient, "
+            f"and tag them in chronological order. {focus} {max_minutes_note}"
+        )
+    else:
+        phase_instructions = (
+            "Phase 2: extract design intent, and label bartender actions or descriptions as "
+            "idealing, calibration, or balancing. Also assign a content_category such as aroma, "
+            "appearance, ingredient, or any other semantic category you infer. Only add a new "
+            "content_category if it is clearly not covered by existing categories. Keep the total "
+            "number of categories small (<= 5) and avoid overly granular labels. "
+            "Be more granular in actions, but not in categories. "
+            "Keep keywords in the original language if present. Do not include punctuation in keywords. "
+            "Ensure no cocktail_id is missed; if a cocktail mentions a category, include at least one item for it. "
+            "Examples: 'Lillet' -> ingredient, '補水果感' -> balancing. "
+            f"{max_minutes_note}"
+        )
     user = f"""
-三軸模型：
-X 軸：Implicit (-1) ↔ Direct (1)
-Y 軸：Conceptual (-1) ↔ Specific (1)
-Z 軸：Complicated (-1) ↔ Simple (1)
+{phase_instructions}
 
-任務：
-1) 從文本中抓取調酒編號（如 P1-1），並在每個項目標記 cocktail_id。
-2) 依調酒編號推導調酒師編號：bartender = "P1" 這種格式（即 P1-1 的前半段）。
-3) 請確保每一杯調酒（每個不同的 cocktail_id）都有關鍵詞/短語可被代表。
-4) 從文本中抽取最多 {max_items} 個「關鍵詞或短語」，由你判斷何者最能代表調酒設計意圖。
-5) 關鍵詞請保持精簡，避免過長；每個詞彙/短語不超過 8 個字或 16 個字符。
-6) 為每個詞彙/短語提供一個簡短的語意說明（intent）。
-7) 為每個詞彙/短語指定 category，必須從下列清單擇一：{category_list}。
-8) 給出每個詞彙的 (x,y,z) 座標，範圍 -1 到 1。
-9) 僅輸出 JSON，不要加入多餘文字。
+Tasks:
+1) Detect cocktail IDs (e.g., P1-1) and include cocktail_id in each item.
+2) Derive bartender from cocktail_id (e.g., bartender = "P1").
+3) Ensure every cocktail_id has at least one item.
+4) Extract up to {max_items} keywords/phrases that represent design intent.
+5) Keep keywords short (<= 8 CJK chars or 16 characters).
+6) Provide a short intent description.
+7) Assign category from: {category_list}. (Phase 2: use content_category instead.)
+8) Phase 2 only: assign action_label from [idealing, calibration, balancing].
+9) Assign time_min as an integer minute based on chronological order, within the timeline bounds.
+   If you see timestamps like mm:ss, convert to nearest minute (e.g., 21:05 -> 21, 08:56 -> 9).
+10) Output JSON only.
 
-輸出格式：
+Output format:
 {{
   "items": [
-    {{"term": "...", "intent": "...", "category": "design_intent", "cocktail_id": "P1-1", "bartender": "P1", "x": 0.0, "y": 0.0, "z": 0.0}}
+    {{"term": "...", "intent": "...", "category": "aroma", "cocktail_id": "P1-1", "bartender": "P1", "time_min": 12}}
   ]
 }}
 
-文本：
+Text:
 \"\"\"{text}\"\"\"
 """.strip()
     return [
@@ -151,12 +246,20 @@ Z 軸：Complicated (-1) ↔ Simple (1)
     ]
 
 
-def call_openai(text: str, model: str, max_items: int) -> Dict[str, Any]:
+def call_openai(
+    text: str,
+    model: str,
+    max_items: int,
+    phase: int,
+    category_defs: Dict[str, Dict[str, str]],
+    phase1_category: str | None,
+    max_minutes: int | None,
+) -> Dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY env var.")
     client = OpenAI(api_key=api_key)
-    messages = build_prompt(text, max_items)
+    messages = build_prompt(text, max_items, phase, category_defs, phase1_category, max_minutes)
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -179,26 +282,47 @@ def call_openai(text: str, model: str, max_items: int) -> Dict[str, Any]:
         return json_repair.loads(content)
 
 
-def normalize_items(items: List[Dict[str, Any]]) -> List[IntentPoint]:
+def normalize_items(items: List[Dict[str, Any]], category_defs: Dict[str, Dict[str, str]], phase: int) -> List[IntentPoint]:
     normalized: List[IntentPoint] = []
     for i, item in enumerate(items):
         term = str(item.get("term", "")).strip()
+        term = re.sub(r"[^\w\u4e00-\u9fff\s]", "", term).strip()
         intent = str(item.get("intent", "")).strip()
         cocktail_id = str(item.get("cocktail_id", "")).strip()
         bartender = str(item.get("bartender", "")).strip()
-        category = str(item.get("category", "other")).strip()
-        if category not in CATEGORY_DEFS:
-            category = "other"
+        if phase == 2:
+            category = str(item.get("content_category", item.get("category", ""))).strip()
+        else:
+            category = str(item.get("category", "")).strip()
         if not bartender and cocktail_id:
             match = re.match(r"^(P\d+)", cocktail_id, re.IGNORECASE)
             if match:
                 bartender = match.group(1).upper()
         if not bartender:
             bartender = "unknown"
-        x = clamp(float(item.get("x", 0.0)))
-        y = clamp(float(item.get("y", 0.0)))
-        z = clamp(float(item.get("z", 0.0)))
-        shape = CATEGORY_DEFS[category]["shape"]
+        time_min_raw = item.get("time_min")
+        time_min = i + 1
+        if isinstance(time_min_raw, str) and re.match(r"^\d{1,2}:\d{2}$", time_min_raw.strip()):
+            try:
+                mm, ss = time_min_raw.strip().split(":")
+                minutes = int(mm)
+                seconds = int(ss)
+                time_min = minutes + (1 if seconds >= 30 else 0)
+            except Exception:
+                time_min = i + 1
+        else:
+            try:
+                time_min = int(time_min_raw)
+            except Exception:
+                time_min = i + 1
+        if phase == 2:
+            action_label = str(item.get("action_label", "")).strip().lower()
+            if action_label not in CATEGORY_DEFS_PHASE2:
+                action_label = "idealing"
+            shape = CATEGORY_DEFS_PHASE2[action_label]["shape"]
+        else:
+            action_label = ""
+            shape = category_defs.get(category, {"shape": "hexagon"})["shape"]
         if term:
             normalized.append(
                 IntentPoint(
@@ -207,9 +331,8 @@ def normalize_items(items: List[Dict[str, Any]]) -> List[IntentPoint]:
                     cocktail_id=cocktail_id,
                     bartender=bartender,
                     category=category,
-                    x=x,
-                    y=y,
-                    z=z,
+                    time_min=time_min,
+                    action_label=action_label,
                     shape=shape,
                 )
             )
@@ -359,9 +482,8 @@ def save_outputs(points: List[IntentPoint], output_dir: str) -> None:
                         "category": p.category,
                         "cocktail_id": p.cocktail_id,
                         "bartender": p.bartender,
-                        "x": p.x,
-                        "y": p.y,
-                        "z": p.z,
+                        "time_min": p.time_min,
+                        "action_label": p.action_label,
                         "shape": p.shape,
                     }
                     for p in points
@@ -373,9 +495,9 @@ def save_outputs(points: List[IntentPoint], output_dir: str) -> None:
         )
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["term", "intent", "category", "cocktail_id", "bartender", "x", "y", "z", "shape"])
+        writer.writerow(["term", "intent", "category", "cocktail_id", "bartender", "time_min", "action_label", "shape"])
         for p in points:
-            writer.writerow([p.term, p.intent, p.category, p.cocktail_id, p.bartender, p.x, p.y, p.z, p.shape])
+            writer.writerow([p.term, p.intent, p.category, p.cocktail_id, p.bartender, p.time_min, p.action_label, p.shape])
 
 
 def next_versioned_path(output_dir: str, basename: str, ext: str) -> str:
@@ -388,213 +510,258 @@ def next_versioned_path(output_dir: str, basename: str, ext: str) -> str:
         n += 1
 
 
-def generate_interactive_plot(points: List[IntentPoint], output_path: str, shape_scale: float) -> None:
-    bartender_names = []
+def generate_interactive_plot(
+    points: List[IntentPoint],
+    output_path: str,
+    shape_scale: float,
+    width: int,
+    height: int,
+    phase: int,
+    phase1_category: str | None,
+    cocktail_ids_from_text: List[str],
+    max_minutes: int | None,
+    phase2_category: str | None = None,
+) -> None:
+    image = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    font = get_font(12)
+
+    margin_left = 90
+    margin_right = 180
+    margin_top = 40
+    margin_bottom = 60
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+
+    cocktail_ids = []
+    for cid in cocktail_ids_from_text:
+        if cid not in cocktail_ids:
+            cocktail_ids.append(cid)
     for point in points:
-        if point.bartender not in bartender_names:
-            bartender_names.append(point.bartender)
-    bartender_map = {name: idx for idx, name in enumerate(bartender_names)}
+        if point.cocktail_id and point.cocktail_id not in cocktail_ids:
+            cocktail_ids.append(point.cocktail_id)
+    if not cocktail_ids:
+        image.save(output_path)
+        return
 
-    xs = [p.x for p in points]
-    ys = [p.y for p in points]
-    zs = [p.z for p in points]
-    colors = [bartender_to_color(p.bartender, bartender_map) for p in points]
-    colors_rgb = [f"rgb({c[0]},{c[1]},{c[2]})" for c in colors]
-    symbols = [PLOTLY_SYMBOLS.get(p.shape, "circle") for p in points]
-    terms = [p.term for p in points]
-    cocktail_ids = [p.cocktail_id for p in points]
-    hover = [
-        f"{p.cocktail_id}<br>{p.term}<br>({p.x:.2f}, {p.y:.2f}, {p.z:.2f})<br>{p.intent}<br>{CATEGORY_DEFS[p.category]['label']}"
-        for p in points
-    ]
-    sizes = [max(16, min(70, (18 + len(t) * 6) * shape_scale * 0.5)) for t in terms]
+    min_time = min(p.time_min for p in points)
+    if min_time == 1:
+        min_time = 0
+    max_time = max(p.time_min for p in points)
+    if max_minutes:
+        max_time = max_minutes
+    if max_time == min_time:
+        max_time += 1
 
-    data = [
-        {
-            "type": "scatter3d",
-            "mode": "markers",
-            "x": xs,
-            "y": ys,
-            "z": zs,
-            "marker": {"size": sizes, "color": colors_rgb, "symbol": symbols, "opacity": 0.95},
-            "hovertext": hover,
-            "hoverinfo": "text",
-            "name": "keyword",
-        },
-        {
-            "type": "scatter3d",
-            "mode": "text",
-            "x": xs,
-            "y": ys,
-            "z": [z + 0.08 for z in zs],
-            "text": cocktail_ids,
-            "textposition": "top center",
-            "textfont": {"color": "white", "size": 12},
-            "hoverinfo": "skip",
-            "name": "cocktail_id",
-        },
-    ]
+    def x_from_time(t: int) -> float:
+        return margin_left + (t - min_time) / (max_time - min_time) * plot_width
 
-    axis_len = 1.8
-    axis_lines = [
-        # X axis (Implicit ↔ Direct)
-        {"x": [-axis_len, axis_len], "y": [0, 0], "z": [0, 0]},
-        # Y axis (Conceptual ↔ Specific)
-        {"x": [0, 0], "y": [-axis_len, axis_len], "z": [0, 0]},
-        # Z axis (Complicated ↔ Simple)
-        {"x": [0, 0], "y": [0, 0], "z": [-axis_len, axis_len]},
-    ]
-    for axis in axis_lines:
-        data.append(
-            {
-                "type": "scatter3d",
-                "mode": "lines",
-                "x": axis["x"],
-                "y": axis["y"],
-                "z": axis["z"],
-                "line": {"color": "#fff", "width": 2, "dash": "dash"},
-                "hoverinfo": "skip",
-                "showlegend": False,
-            }
-        )
+    min_y = margin_top + 16
+    max_y = margin_top + plot_height - 16
+    if len(cocktail_ids) == 1:
+        y_positions = {cocktail_ids[0]: (min_y + max_y) / 2}
+    else:
+        step = (max_y - min_y) / (len(cocktail_ids) - 1)
+        y_positions = {cid: min_y + idx * step for idx, cid in enumerate(cocktail_ids)}
 
-    label_offset = 0.2
-    axis_labels = [
-        {"x": axis_len + label_offset, "y": 0, "z": 0, "text": "Direct"},
-        {"x": -axis_len - label_offset, "y": 0, "z": 0, "text": "Implicit"},
-        {"x": 0, "y": axis_len + label_offset, "z": 0, "text": "Specific"},
-        {"x": 0, "y": -axis_len - label_offset, "z": 0, "text": "Conceptual"},
-        {"x": 0, "y": 0, "z": axis_len + label_offset, "text": "Simple"},
-        {"x": 0, "y": 0, "z": -axis_len - label_offset, "text": "Complicated"},
-    ]
-    data.append(
-        {
-            "type": "scatter3d",
-            "mode": "text",
-            "x": [a["x"] for a in axis_labels],
-            "y": [a["y"] for a in axis_labels],
-            "z": [a["z"] for a in axis_labels],
-            "text": [a["text"] for a in axis_labels],
-            "textfont": {"color": "white", "size": 14},
-            "hoverinfo": "skip",
-            "showlegend": False,
-        }
+    # Axes
+    draw.line([margin_left, margin_top, margin_left, margin_top + plot_height], fill=(0, 0, 0, 255), width=2)
+    draw.line([margin_left, margin_top + plot_height, margin_left + plot_width, margin_top + plot_height], fill=(0, 0, 0, 255), width=2)
+
+    # X ticks (integer minutes)
+    tick_range = max_time - min_time
+    tick_step = 1 if tick_range <= 30 else max(1, round(tick_range / 20))
+    for t in range(min_time, max_time + 1, tick_step):
+        x = x_from_time(t)
+        draw.line([x, margin_top + plot_height, x, margin_top + plot_height + 6], fill=(0, 0, 0, 255), width=1)
+        draw.text((x - 6, margin_top + plot_height + 10), str(t), fill=(0, 0, 0, 255), font=font)
+
+    draw.text(
+        (margin_left + plot_width / 2 - 24, margin_top + plot_height + 32),
+        "Minutes",
+        fill=(0, 0, 0, 255),
+        font=font,
     )
 
-    layout = {
-        "scene": {
-            "xaxis": {
-                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
-                "showbackground": False,
-                "showgrid": False,
-                "zeroline": False,
-                "showticklabels": False,
-                "visible": False,
-            },
-            "yaxis": {
-                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
-                "showbackground": False,
-                "showgrid": False,
-                "zeroline": False,
-                "showticklabels": False,
-                "visible": False,
-            },
-            "zaxis": {
-                "range": [-(axis_len + label_offset + 0.2), axis_len + label_offset + 0.2],
-                "showbackground": False,
-                "showgrid": False,
-                "zeroline": False,
-                "showticklabels": False,
-                "visible": False,
-            },
-            "bgcolor": "black",
-        },
-        "paper_bgcolor": "black",
-        "font": {"color": "white"},
-        "hoverlabel": {"font": {"size": 12}},
-        "margin": {"l": 40, "r": 240, "t": 40, "b": 40},
-        "title": "Cocktail Design Intent Map",
-        "showlegend": False,
-    }
+    # Y labels
+    label_right_x = margin_left - 8
+    for cid, y in y_positions.items():
+        try:
+            text_w = draw.textlength(cid, font=font)
+        except Exception:
+            text_w = max(10, len(cid) * 7)
+        draw.text((label_right_x - text_w, y - 6), cid, fill=(0, 0, 0, 255), font=font)
 
-    legend_entries = []
-    used_categories = []
-    for p in points:
-        if p.category not in used_categories:
-            used_categories.append(p.category)
-    for key, meta in CATEGORY_DEFS.items():
-        if key in used_categories:
-            legend_entries.append((meta["shape"], meta["label"]))
+    marker_size = max(12, min(32, int(10 * shape_scale)))
 
-    def svg_for_shape(shape: str) -> str:
-        if shape == "square":
-            return '<svg width="22" height="22"><rect x="3" y="3" width="16" height="16" fill="#ccc"/></svg>'
-        if shape == "circle":
-            return '<svg width="22" height="22"><circle cx="11" cy="11" r="8" fill="#ccc"/></svg>'
-        if shape == "triangle":
-            return '<svg width="22" height="22"><polygon points="11,3 19,19 3,19" fill="#ccc"/></svg>'
-        if shape == "diamond":
-            return '<svg width="22" height="22"><polygon points="11,3 19,11 11,19 3,11" fill="#ccc"/></svg>'
-        if shape == "star":
-            return '<svg width="22" height="22"><polygon points="11,2 13,8 20,8 14,12 16,19 11,15 6,19 8,12 2,8 9,8" fill="#ccc"/></svg>'
-        if shape == "pentagon":
-            return '<svg width="22" height="22"><polygon points="11,2 20,8 16,19 6,19 2,8" fill="#ccc"/></svg>'
-        if shape == "hexagon":
-            return '<svg width="22" height="22"><polygon points="6,3 16,3 20,11 16,19 6,19 2,11" fill="#ccc"/></svg>'
-        return '<svg width="22" height="22"><circle cx="11" cy="11" r="8" fill="#ccc"/></svg>'
+    if phase == 1 and phase1_category:
+        filtered_points = [p for p in points if p.category == phase1_category]
+    elif phase == 2 and phase2_category:
+        filtered_points = [p for p in points if p.category == phase2_category]
+    else:
+        filtered_points = points
 
-    legend_html = "".join(
-        [
-            f'<div class="legend-item">{svg_for_shape(shape)}<span>{shape_label}</span></div>'
-            for shape, shape_label in legend_entries
+    category_color_map: Dict[str, Tuple[int, int, int]] = {}
+    palette = [
+        (0, 128, 0),
+        (30, 144, 255),
+        (255, 140, 0),
+        (128, 0, 128),
+        (220, 20, 60),
+        (105, 105, 105),
+        (0, 191, 255),
+        (154, 205, 50),
+    ]
+    next_idx = 0
+
+    slot_counts: Dict[Tuple[str, int], int] = {}
+    offsets = [
+        (0, 0),
+        (10, -10),
+        (-10, 10),
+        (14, 12),
+        (-14, -12),
+        (20, -6),
+        (-20, 6),
+        (24, 0),
+        (-24, 0),
+        (0, 16),
+        (0, -16),
+    ]
+    seen_labels: set[Tuple[str, int, str]] = set()
+    for point in filtered_points:
+        time_value = point.time_min
+        if max_minutes:
+            time_value = max(min_time, min(time_value, max_time))
+        px = x_from_time(time_value)
+        py = y_positions.get(point.cocktail_id, (min_y + max_y) / 2)
+        label_key = point.category if phase == 1 else point.action_label
+        dedupe_key = (point.cocktail_id, time_value, label_key)
+        if dedupe_key in seen_labels:
+            continue
+        seen_labels.add(dedupe_key)
+        slot_key = (point.cocktail_id, time_value)
+        slot_counts[slot_key] = slot_counts.get(slot_key, 0) + 1
+        offset_idx = slot_counts[slot_key] - 1
+        dx, dy = offsets[offset_idx % len(offsets)]
+        px = min(max(px + dx, margin_left + 4), margin_left + plot_width - 4)
+        py = min(max(py + dy, min_y), max_y)
+        if phase == 1:
+            if point.category not in CATEGORY_COLORS_PHASE1:
+                continue
+            color = CATEGORY_COLORS_PHASE1.get(point.category, (0, 0, 0))
+            draw_shape(draw, point.shape, (px, py), marker_size, color)
+        else:
+            if point.category not in category_color_map:
+                category_color_map[point.category] = palette[next_idx % len(palette)]
+                next_idx += 1
+            color = category_color_map[point.category]
+            draw_shape(draw, point.shape, (px, py), marker_size, color)
+
+    # Right-side legend
+    legend_x = margin_left + plot_width + 20
+    legend_y = margin_top + 10
+    if phase == 1:
+        label = f"{phase1_category} timeline" if phase1_category else "Phase 1 timeline"
+        draw.text((legend_x, legend_y), label, fill=(0, 0, 0, 255), font=font)
+        legend_items = []
+        for key in CATEGORY_DEFS_PHASE1.keys():
+            if phase1_category and key != phase1_category:
+                continue
+            legend_items.append((CATEGORY_DEFS_PHASE1[key]["shape"], CATEGORY_DEFS_PHASE1[key]["label"], key))
+        for idx, (shape, label_text, key) in enumerate(legend_items):
+            y = legend_y + 20 + idx * 20
+            color = CATEGORY_COLORS_PHASE1.get(key, (0, 0, 0))
+            draw_shape(draw, shape, (legend_x + 10, y + 6), 10, color)
+            draw.text((legend_x + 24, y), label_text, fill=(0, 0, 0, 255), font=font)
+    else:
+        draw.text((legend_x, legend_y), "Phase 2 legend", fill=(0, 0, 0, 255), font=font)
+        y_cursor = legend_y + 20
+        for category, color in category_color_map.items():
+            if phase2_category and category != phase2_category:
+                continue
+            draw.rectangle([legend_x, y_cursor + 2, legend_x + 12, y_cursor + 12], fill=color)
+            draw.text((legend_x + 18, y_cursor), category, fill=(0, 0, 0, 255), font=font)
+            y_cursor += 18
+        y_cursor += 6
+        legend_items = [
+            ("star", "Idealing"),
+            ("circle", "Calibration"),
+            ("square", "Balancing"),
         ]
-    )
+        for shape, label_text in legend_items:
+            draw_shape(draw, shape, (legend_x + 10, y_cursor + 6), 10, (0, 0, 0, 255))
+            draw.text((legend_x + 24, y_cursor), label_text, fill=(0, 0, 0, 255), font=font)
+            y_cursor += 18
 
-    html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-  <style>
-    body {{ margin:0; background:black; color:white; font-family: Arial, sans-serif; }}
-    #wrap {{ display:flex; height:100vh; }}
-    #plot {{ flex:1; }}
-    #legend {{
-      width:220px;
-      padding:16px 10px;
-      border-left:1px solid #333;
-      background:#000;
-      box-sizing:border-box;
-    }}
-    .legend-title {{ font-size:14px; margin-bottom:8px; }}
-    .legend-item {{
-      display:flex;
-      align-items:center;
-      gap:8px;
-      margin-bottom:6px;
-      font-size:13px;
-    }}
-  </style>
-</head>
-<body>
-  <div id="wrap">
-    <div id="plot"></div>
-    <div id="legend">
-      <div class="legend-title">類別圖示</div>
-      {legend_html}
-    </div>
-  </div>
-  <script>
-    const data = {json.dumps(data, ensure_ascii=False)};
-    const layout = {json.dumps(layout, ensure_ascii=False)};
-    Plotly.newPlot('plot', data, layout, {{displaylogo: false}});
-  </script>
-</body>
-</html>
-"""
+    image.save(output_path)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
+
+def generate_counts_chart(
+    points: List[IntentPoint],
+    output_path: str,
+    width: int,
+    height: int,
+    phase: int,
+    phase1_category: str | None,
+) -> None:
+    image = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    font = get_font(12)
+
+    margin_left = 80
+    margin_right = 40
+    margin_top = 40
+    margin_bottom = 60
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+
+    if phase == 1:
+        labels = [k for k in CATEGORY_DEFS_PHASE1.keys() if not phase1_category or k == phase1_category]
+    else:
+        labels = []
+        for p in points:
+            if p.category not in labels:
+                labels.append(p.category)
+    counts = {label: 0 for label in labels}
+    for p in points:
+        if phase == 1 and phase1_category and p.category != phase1_category:
+            continue
+        if p.category in counts:
+            counts[p.category] += 1
+
+    if not counts:
+        image.save(output_path)
+        return
+
+    max_count = max(counts.values()) if counts.values() else 1
+    bar_count = len(counts)
+    bar_width = max(12, int(plot_width / (bar_count * 1.5)))
+    gap = max(6, int(bar_width * 0.5))
+
+    # Axes
+    draw.line([margin_left, margin_top, margin_left, margin_top + plot_height], fill=(0, 0, 0, 255), width=2)
+    draw.line([margin_left, margin_top + plot_height, margin_left + plot_width, margin_top + plot_height], fill=(0, 0, 0, 255), width=2)
+
+    # Bars
+    x = margin_left + gap
+    for label, count in counts.items():
+        bar_height = int((count / max_count) * (plot_height - 10))
+        x1 = x
+        y1 = margin_top + plot_height - bar_height
+        x2 = x + bar_width
+        y2 = margin_top + plot_height
+        if phase == 1:
+            color = CATEGORY_COLORS_PHASE1.get(label, (0, 0, 0))
+        else:
+            color = (0, 0, 0)
+        draw.rectangle([x1, y1, x2, y2], fill=color)
+        draw.text((x1, y2 + 6), label, fill=(0, 0, 0, 255), font=font)
+        draw.text((x1, y1 - 14), str(count), fill=(0, 0, 0, 255), font=font)
+        x += bar_width + gap
+
+    draw.text((margin_left, margin_top - 24), "Label counts", fill=(0, 0, 0, 255), font=font)
+    image.save(output_path)
 
 
 def main() -> int:
@@ -607,41 +774,75 @@ def main() -> int:
     parser.add_argument("--point-size", type=int, default=22, help="Marker size in pixels.")
     parser.add_argument("--scale", type=float, default=None, help="Axis radius in pixels.")
     parser.add_argument("--no-label", action="store_true", help="Disable term labels on image.")
-    parser.add_argument("--interactive", action="store_true", help="Generate interactive HTML instead of PNG.")
+    parser.add_argument("--phase", type=int, choices=[1, 2], default=1, help="Phase 1 or 2 classification.")
+    parser.add_argument("--phase1-category", choices=list(CATEGORY_DEFS_PHASE1.keys()), help="Phase 1 focus category.")
+    parser.add_argument("--max-minutes", type=int, help="Override max minutes for timeline axis.")
+    parser.add_argument("--batch-categories", action="store_true", help="Batch output per category (phase 2).")
+    parser.add_argument("--counts", action="store_true", help="Output label counts chart.")
     parser.add_argument("--shape-scale", type=float, default=2.0, help="Scale factor for marker size in interactive mode.")
     parser.add_argument("--width", type=int, default=1000, help="Auto background width.")
     parser.add_argument("--height", type=int, default=1000, help="Auto background height.")
     args = parser.parse_args()
 
     text = load_text(args.input)
-    data = call_openai(text, args.model, args.max_items)
+    all_cocktail_ids = extract_cocktail_ids(text)
+    detected_max_minutes = extract_max_minutes(text)
+    max_minutes = args.max_minutes if args.max_minutes else detected_max_minutes
+    category_defs = CATEGORY_DEFS_PHASE1 if args.phase == 1 else CATEGORY_DEFS_PHASE2
+    data = call_openai(text, args.model, args.max_items, args.phase, category_defs, args.phase1_category, max_minutes)
     items = data.get("items", [])
-    points = normalize_items(items)
+    points = normalize_items(items, category_defs, args.phase)
     if not points:
         raise RuntimeError("No items returned from model.")
 
     save_outputs(points, args.output_dir)
-    if args.interactive:
-        output_html_path = next_versioned_path(args.output_dir, "intent_points_interactive", ".html")
-        generate_interactive_plot(points, output_html_path, args.shape_scale)
-        print(f"Saved: {output_html_path}")
+    suffix = f"phase{args.phase}"
+    if args.phase == 1 and args.phase1_category:
+        suffix += f"_{args.phase1_category}"
+    if args.phase == 2 and args.batch_categories:
+        categories = []
+        for p in points:
+            if p.category not in categories:
+                categories.append(p.category)
+        for cat in categories:
+            output_png_path = next_versioned_path(args.output_dir, f"intent_points_{suffix}_{cat}", ".png")
+            generate_interactive_plot(
+                points,
+                output_png_path,
+                args.shape_scale,
+                args.width,
+                args.height,
+                args.phase,
+                args.phase1_category,
+                all_cocktail_ids,
+                max_minutes,
+                cat,
+            )
+            print(f"Saved: {output_png_path}")
     else:
-        base_image_path = args.image
-        if not base_image_path:
-            base_image_path = create_axis_background(args.output_dir, args.width, args.height)
-        output_image_path = next_versioned_path(args.output_dir, "intent_points_overlay", ".png")
-        overlay_points(
-            base_image_path=base_image_path,
-            points=points,
-            output_path=output_image_path,
-            size=args.point_size,
-            scale=args.scale,
-            label=not args.no_label,
+        output_png_path = next_versioned_path(args.output_dir, f"intent_points_{suffix}", ".png")
+        generate_interactive_plot(
+            points,
+            output_png_path,
+            args.shape_scale,
+            args.width,
+            args.height,
+            args.phase,
+            args.phase1_category,
+            all_cocktail_ids,
+            max_minutes,
         )
-        print(f"Saved: {output_image_path}")
+        print(f"Saved: {output_png_path}")
+
+    if args.counts:
+        counts_path = next_versioned_path(args.output_dir, f"intent_points_{suffix}_counts", ".png")
+        generate_counts_chart(points, counts_path, args.width, args.height, args.phase, args.phase1_category)
+        print(f"Saved: {counts_path}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
